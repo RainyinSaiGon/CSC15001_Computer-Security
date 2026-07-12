@@ -1,46 +1,34 @@
-# Mini Vault — Project Requirements
+# Assignment 1 — Mini Vault
 
 **Course:** Computer Security
-**Assignment:** 1 — Mini Vault (Secure Storage & Encryption/Signing as a Service)
-**Team size:** 3 students
-**Language:** Python (`cryptography`, `bcrypt`/`argon2-cffi`, `secrets`)
+**Topic:** Secure Storage (KV Engine) & Encryption / Signing as a Service (Transit Engine)
 
 ---
 
-## 1. Problem Statement
+## I. Product Overview
 
-Secrets (DB passwords, API keys, etc.) are often stored in plaintext or encrypted with hardcoded keys embedded in code. Mini Vault solves two problems:
+### 1. Problem Statement
+Secrets (DB passwords, API keys...) and sensitive data are often stored in plaintext or encrypted with hardcoded keys embedded in the code. Mini Vault solves two core problems:
+1. **Storing secrets** so that data on disk is ALWAYS encrypted and only the rightful owner can read it.
+2. **Allowing other applications to encrypt/decrypt or digitally sign their own data** WITHOUT EVER having to hold the encryption or signing key themselves.
 
-1. **Storage**: data on disk is *always* ciphertext, and only the rightful owner can read it.
-2. **Crypto-as-a-service**: other applications can encrypt/decrypt or digitally sign their own data **without ever holding the key themselves**.
+### 2. Two Core Features & Success Criteria
 
----
-
-## 2. Architecture Overview
-
-```
-Master Passphrase (never stored)
-      │  Argon2id + salt
-      ▼
-Derived Key (memory only, exists while unlocked)
-      │  AES-256-GCM wrap
-      ▼
-DEK — Data Encryption Key (random, generated once at init)
-   on disk only as: encrypted_dek_b64
-      │  AES-256-GCM
-      ▼
-Everything else: KV secrets, Transit AES keys, Transit private signing keys
-```
-
-- **Vault-level lock** (Feature 0.1): one Master Passphrase per deployment. Controls whether the DEK is in memory at all.
-- **User-level auth** (Feature 0.2): many registered users, each with their own namespace, independent of vault lock state.
-- **KV Engine** (Feature 1): per-user encrypted key-value secret storage.
-- **Transit Engine** (Feature 2): per-user named keys usable only via encrypt/decrypt/sign/verify calls — key material never leaves the server.
+| Feature | Required Security Criteria |
+|---|---|
+| **1. Secure Storage (KV Engine)** | Encrypted at rest (data on disk is always ciphertext) + Access-Controlled (only the owner can read/write). |
+| **2. Encryption & Signing as a Service (Transit Engine)** | The encryption/signing key never leaves the server; ciphertext and signatures carry integrity authentication (AEAD / digital signature); only the owner of a named key can use that key. |
 
 ---
 
-## 3. Required Folder Structure
+## II. General Rules
 
+*   Each group has 3 students. Clearly state each member's role in the report.
+*   Recommended language: Python (`cryptography`, `bcrypt`/`argon2-cffi`, `secrets`).
+*   Code must be clear and commented; avoid copy-pasting libraries of unknown origin.
+*   **Interface:** A CLI is sufficient; a REST API (FastAPI/Flask) is encouraged to better reflect a client calling a "service", similar to the real Vault.
+
+### Project Folder Structure (Recommended)
 ```
 StudentID1_StudentID2_StudentID3/
 ├── README.md
@@ -48,8 +36,8 @@ StudentID1_StudentID2_StudentID3/
 ├── .env.example
 ├── main.py
 ├── src/
-│   ├── core/       # Master Passphrase, init/unlock, DEK (0.1)
-│   ├── auth/       # Register/login, session token (0.2)
+│   ├── core/       # Master Passphrase, init/unlock, DEK (section 0.1)
+│   ├── auth/       # Register/login, session token (section 0.2)
 │   ├── kv/         # Feature 1: Secure Storage
 │   ├── transit/    # Feature 2: Encryption & Signing as a Service
 │   └── storage/    # Read/write data to disk
@@ -61,29 +49,27 @@ StudentID1_StudentID2_StudentID3/
     └── report/
 ```
 
-### Submission naming
-
-- Zip the whole folder: `StudentID1_StudentID2_StudentID3.zip`
-- Report: `Report_StudentID1_StudentID2_StudentID3.pdf` → placed in `docs/report/`
-- Demo video (recommended, 3–5 min): unlisted Drive/YouTube link in `README.md`
+### Naming & Packaging Rules for Submission
+*   Compress the entire folder into `StudentID1_StudentID2_StudentID3.zip`.
+*   Name the report `Report_StudentID1_StudentID2_StudentID3.pdf`, placed under `docs/report/`.
+*   Demo video (recommended) uploaded to Drive/YouTube (Unlisted), with the link included in `README.md`.
 
 ---
 
-## 4. Feature Specifications
+## III. Required Feature Specification
 
-### 0.1 — Vault Initialization & Unlock
+### Feature 0: Initialization and Registration / Login
 
-**Goal:** One Master Passphrase per deployment; DEK never touches disk in plaintext; default state after restart is always `locked`.
+#### 0.1. Vault Initialization & Unlock with Master Passphrase
+**User Story:** As the person deploying Mini Vault, I set a single Master Passphrase when starting the system for the first time, and must re-enter that exact passphrase every time it restarts to "unlock" the data.
 
-**Flow:**
+**Functional Flow:**
+1. **First run (init):** Enter a sufficiently strong Master Passphrase. Derive a key from the passphrase using a KDF (Argon2id/PBKDF2, with a randomly generated salt stored separately).
+2. **Generate a random Data Encryption Key (DEK)**, encrypt the DEK with the derived key (AES-256-GCM), and write it to disk (`encrypted_dek_b64` + `salt`).
+3. **On every restart**, the default state is "locked" — both Feature 1 (KV) and Feature 2 (Transit) refuse to operate.
+4. **Re-entering the correct Master Passphrase** → re-derive the key → decrypt the DEK → transition to "unlocked".
 
-1. First run: admin sets Master Passphrase → derive key via KDF (Argon2id or PBKDF2-HMAC-SHA256) with a random salt.
-2. Generate random DEK → encrypt with derived key (AES-256-GCM) → persist `encrypted_dek_b64` + `kdf_salt_b64`.
-3. Every restart: state defaults to `locked`; Feature 1 & 2 refuse to operate.
-4. Correct passphrase re-entered → re-derive key → decrypt DEK → state becomes `unlocked`.
-
-**Data contract:**
-
+**Data Contract:**
 ```json
 {
   "kdf": "argon2id",
@@ -93,122 +79,125 @@ StudentID1_StudentID2_StudentID3/
 }
 ```
 
-**Error handling:**
+**Error Cases to Handle:**
+*   Wrong Master Passphrase → DEK decryption fails (GCM tag mismatch) → generic error, no detail disclosed.
+*   Calling any Feature 1 or Feature 2 API while locked → `'VAULT_LOCKED'` error.
 
-- Wrong passphrase → GCM tag mismatch → generic error (no detail disclosed)
-- Any Feature 1/2 call while locked → `VAULT_LOCKED`
+**Acceptance Criteria:**
+*   The plaintext DEK must never be written to disk.
+*   After a restart, the state must always be locked until the correct Master Passphrase is entered.
 
-**Acceptance criteria:**
+*Technical Hint:* KDF: Argon2id (`argon2-cffi`) or PBKDF2-HMAC-SHA256. AES-GCM: NIST SP 800-38D.
 
-- [ ] Plaintext DEK never written to disk
-- [ ] State is always `locked` after restart until correct passphrase is entered
+#### 0.2. User Identity Authentication
+**User Story:** As a user, I register and log in so the system knows exactly who I am before letting me touch any secret or key.
 
----
+**Functional Flow:**
+1. **Register:** Email + passphrase + confirm passphrase. Check passphrase strength and ensure the email doesn't already exist.
+2. **Hash the passphrase** with a dedicated password-hashing algorithm (bcrypt/argon2) — DO NOT hash with plain SHA.
+3. **Login:** Email + passphrase matching the stored hash → issue a session token with an expiry (e.g., 30 minutes), used for every request to Feature 1 and Feature 2.
+4. **5 consecutive failed passphrase attempts** → temporarily lock the account for 5 minutes (mandatory).
 
-### 0.2 — User Identity Authentication
-
-**Goal:** Every user is known before touching any secret or key.
-
-**Flow:**
-
-1. Register: email + passphrase + confirm → check strength, check email uniqueness.
-2. Hash passphrase with bcrypt or argon2 (never plain SHA).
-3. Login: email + passphrase → issue session token with expiry (e.g. 30 min).
-4. 5 consecutive failed attempts → lock account for 5 minutes (mandatory).
-
-**Data contract:**
-
+**Data Contract:**
 ```json
-{ "email": "alice@example.com", "password_hash": "<bcrypt/argon2>" }
+{
+  "email": "alice@example.com",
+  "password_hash": "<bcrypt/argon2>"
+}
 ```
 
-**Error handling:**
+**Error Cases to Handle:**
+*   Account does not exist at login → error message.
+*   Session token expired → require re-login.
 
-- Nonexistent account at login → error
-- Expired session token → require re-login
+**Acceptance Criteria:**
+*   Every Feature 1 and Feature 2 API call must require a valid session token; no endpoint may skip this check.
+*   **Required test:** Deliberately enter the wrong passphrase 5 times in a row → the account must be locked for exactly 5 minutes, and login must fail even with the correct passphrase while locked.
 
-**Acceptance criteria:**
-
-- [ ] Every Feature 1/2 API call requires a valid session token — no exceptions
-- [ ] **Required test:** 5 wrong passphrases in a row → account locked exactly 5 minutes; correct passphrase still fails during lockout
+*Technical Hint:* Library: `bcrypt` or `argon2-cffi`.
 
 ---
 
-### 1.1 — KV Engine: Encrypted-at-Rest Storage
+### Feature 1: Secure Storage — KV Engine
 
-**Security guarantee:** Anyone with the raw data file but not the DEK cannot read secret contents.
+#### 1.1. Encrypted-at-Rest Storage
+**Security Guarantee:** Anyone who obtains the raw data file (leaked backup, lost USB drive...) without the DEK CANNOT read the secret's content, even if the vault is unlocked on another machine.
 
-**Flow:**
+**User Story:** As a user, I want to store a secret (e.g., a DB password) under a name (path) and retrieve the exact same content later, without worrying about exposure if the storage file falls into someone else's hands.
 
-1. `write(path, data, token)` — data is any JSON object.
-2. Encrypt full payload with AES-256-GCM + DEK, fresh random nonce every write (never reuse nonce+key).
-3. Persist ciphertext + nonce + tag; overwrite existing path directly (no version history).
-4. `read(path, token)` — decrypt, verify tag before returning; invalid tag → refuse outright.
-5. `delete(path, token)` — permanent deletion.
+**Functional Flow:**
+1. Client calls `write(path, data)`, where `data` is any JSON object, along with a session token.
+2. The system encrypts the entire data payload using AEAD (AES-256-GCM) with the current DEK, generating a fresh random nonce for every write (never reusing a nonce with the same key).
+3. Write the ciphertext + nonce + tag to disk; an existing path (if any) is overwritten directly, with NO version history kept.
+4. Client calls `read(path)` → the system decrypts using the DEK and verifies the tag before returning data; if the tag is invalid → refuse outright, never returning data that "might be right, might be wrong".
+5. Client calls `delete(path)` → permanently deletes the record.
 
-**API:**
+**Input / Output:**
 
 | API | Input | Output |
 |---|---|---|
-| write | path, data (JSON), token | created_at / updated_at |
-| read | path, token | decrypted data (only if tag valid) |
-| delete | path, token | deletion confirmation |
+| **write** | path, data (JSON), token | created_at / updated_at |
+| **read** | path, token | decrypted data (only if the tag is valid) |
+| **delete** | path, token | deletion confirmation |
 
-**Data contract:**
-
+**Data Contract:**
 ```json
-{ "path": "secret/alice@example.com/db", "nonce_b64": "...", "ciphertext_b64": "...", "tag_b64": "..." }
+{
+  "path": "secret/alice@example.com/db",
+  "nonce_b64": "...",
+  "ciphertext_b64": "...",
+  "tag_b64": "..."
+}
 ```
 
-**Error handling:**
+**Error Cases to Handle:**
+*   Write/read while the vault is locked → `'VAULT_LOCKED'`.
+*   Authentication tag mismatch on read (data on disk was manually tampered with) → refuse to decrypt and do not return the secret.
+*   Reading a path that doesn't exist → `'NOT_FOUND'`, no garbage data returned.
 
-- Locked vault → `VAULT_LOCKED`
-- Tag mismatch (tampered data) → refuse to decrypt
-- Nonexistent path → `NOT_FOUND`, no garbage data returned
+**Acceptance Criteria:**
+*   `write` then `read` on the same path must return the original data exactly (round-trip test).
+*   Opening the data file directly in a text editor: no plaintext fragment of any secret should be visible.
+*   **Test:** Manually altering 1 byte in the ciphertext or tag on disk → read must refuse, never returning corrupted data.
 
-**Acceptance criteria:**
+*Technical Hint:* AES-256-GCM: NIST SP 800-38D. Do not use CBC without integrity authentication.
 
-- [ ] write → read round-trip returns exact original data
-- [ ] No plaintext fragment visible when opening the data file directly
-- [ ] Manually altering 1 byte of ciphertext/tag on disk → read refuses, never returns corrupted data
+#### 1.2. Ownership-based Access Control
+**Security Guarantee:** A valid session token belonging to user A cannot read/write/delete a secret in user B's namespace, even by guessing the correct path.
 
----
+**User Story:** As a user, I am guaranteed that only I (the owner) can read/write/delete my own secrets, even if someone else knows the exact path.
 
-### 1.2 — KV Engine: Ownership-based Access Control
+**Functional Flow:**
+1. Every secret is stored under a path with a fixed owner prefix: `secret/<email>/...`.
+2. Every `write`/`read`/`delete` request checks whether the email in the session token matches the email in the path prefix.
+3. If they don't match → refuse immediately BEFORE touching any encryption/decryption operation, returning a generic error that doesn't distinguish between "path doesn't exist" and "no permission" (to avoid leaking which paths are in use).
+4. Log every denied access attempt along with the requester's email and the denied path.
 
-**Security guarantee:** User A cannot read/write/delete a secret in user B's namespace, even knowing the exact path.
+**Error Cases to Handle:**
+*   Valid token but not the owner of the path namespace → `'PERMISSION_DENIED'` (without disclosing whether that path exists).
+*   Token expired or invalid → `'UNAUTHENTICATED'`, rejected before permission is even evaluated.
 
-**Flow:**
+**Acceptance Criteria:**
+*   **Required test:** User A, using their own valid token, attempts to read `secret/<B's email>/...` → must be denied 100% of the time.
+*   **Test:** A request with a missing/completely invalid token must never reach the path-check step.
 
-1. Every secret stored under `secret/<email>/...`.
-2. Every request checks token email vs. path's email prefix.
-3. Mismatch → refuse **before** any crypto operation; generic error (doesn't distinguish "not found" vs "no permission").
-4. Log every denied attempt (requester email + denied path).
-
-**Error handling:**
-
-- Valid token, wrong namespace → `PERMISSION_DENIED` (no existence disclosure)
-- Invalid/expired token → `UNAUTHENTICATED`, rejected before permission check
-
-**Acceptance criteria:**
-
-- [ ] **Required test:** User A's valid token reading `secret/<B's email>/...` → denied 100% of the time
-- [ ] Missing/invalid token never reaches the path-check step
+*Technical Hint:* This is a minimal (ownership-based) access control model.
 
 ---
 
-### 2.1 — Transit Engine: Named Key Management
+### Feature 2: Encryption & Signing as a Service — Transit Engine
 
-**Security guarantee:** Key material is never returned via any API, under any form, even to its owner.
+#### 2.1. Named Key Management
+**Security Guarantee:** The key used to encrypt a client's data is NEVER returned through any API, under any form (even to its own owner) — it can only be used indirectly via encrypt/decrypt.
 
-**Flow:**
+**User Story:** As a user, I want to create a named key dedicated to encrypting my own data, without having to generate and safeguard the AES key myself.
 
-1. `create_key(key_name, token)` → generate random AES-256 key, bind to `key_name` + owner email, `key_usage = "ENCRYPT_DECRYPT"`.
-2. Encrypt the AES key with the DEK before persisting.
-3. `list_keys()` → names + `key_usage` only, never material. `revoke_key(key_name)` → permanent delete.
+**Functional Flow:**
+1. Client calls `create_key(key_name)` with a token → the system generates a random AES-256 key, bound to `key_name` and the owner (email from the token). This key is stored with `key_usage = "ENCRYPT_DECRYPT"` to distinguish it from the signing keys created in section 2.4.
+2. This AES key is encrypted with the DEK before being written to disk — named keys must also be encrypted at rest, exactly like the secrets in Feature 1.
+3. The client can call `list_keys()` to see the names and `key_usage` of keys they've created (never the real key material), and `revoke_key(key_name)` to permanently delete a named key.
 
-**Data contract:**
-
+**Data Contract:**
 ```json
 {
   "key_name": "my-key",
@@ -218,85 +207,76 @@ StudentID1_StudentID2_StudentID3/
 }
 ```
 
-**Error handling:**
+**Error Cases to Handle:**
+*   Creating a `key_name` that already exists (owned by the same user) → prompt for overwrite confirmation, or reject and ask for a different name (group's choice, to be documented in the report).
+*   Creating/deleting a key while the vault is locked → `'VAULT_LOCKED'`.
 
-- Duplicate key_name (same owner) → overwrite confirmation OR reject (team's choice, document in report)
-- Locked vault → `VAULT_LOCKED`
+**Acceptance Criteria:**
+*   No API (including `list_keys`) ever returns the real AES key in plaintext or base64 form.
 
-**Acceptance criteria:**
+#### 2.2. Encryption / Decryption as a Service (Encrypt & Decrypt API)
+**User Story:** As a user, I send raw data to Mini Vault to be encrypted with my named key, and later send back the ciphertext to be decrypted at any time, without needing to know the real key.
 
-- [ ] No API (including `list_keys`) ever returns real AES key material
+**Functional Flow:**
+1. Client calls `encrypt(key_name, plaintext_b64, token)` → the system verifies ownership of `key_name` (see 2.3), temporarily decrypts the AES key using the in-memory DEK, generates a random nonce, and encrypts the plaintext (AES-256-GCM).
+2. Returns a self-describing ciphertext containing `key_name` + nonce + ciphertext + tag, so the client never needs to remember which key was used.
+3. Client calls `decrypt(ciphertext, token)` → the system reads the `key_name` embedded in the ciphertext, checks permission, decrypts the corresponding AES key using the DEK, decrypts and verifies the tag, and returns the plaintext.
 
----
-
-### 2.2 — Transit Engine: Encrypt / Decrypt as a Service
-
-**Flow:**
-
-1. `encrypt(key_name, plaintext_b64, token)` → verify ownership (2.3) → temporarily decrypt AES key via in-memory DEK → random nonce → AES-256-GCM encrypt.
-2. Return self-describing ciphertext: `vault:<key_name>:<base64(nonce+ct+tag)>`.
-3. `decrypt(ciphertext, token)` → parse embedded key_name → check permission → decrypt AES key via DEK → decrypt + verify tag → return plaintext.
-
-**API:**
+**Input / Output:**
 
 | API | Input | Output |
 |---|---|---|
-| encrypt | key_name, plaintext (base64), token | `vault:<key_name>:<base64(nonce+ct+tag)>` |
-| decrypt | ciphertext, token | plaintext (base64) |
+| **encrypt** | key_name, plaintext (base64), token | ciphertext of the form `vault:<key_name>:<base64(nonce+ct+tag)>` |
+| **decrypt** | ciphertext, token | plaintext (base64) |
 
-**Error handling:**
+**Error Cases to Handle:**
+*   Malformed or truncated ciphertext → refuse to decrypt.
+*   GCM tag mismatch (ciphertext has been tampered with) → refuse, with a clear reason.
+*   `key_name` doesn't exist or has been revoked → refuse both encrypt and decrypt.
+*   `key_name` exists but its `key_usage` is `"SIGN_VERIFY"` (created in section 2.4), not `"ENCRYPT_DECRYPT"` → reject with a clear error, mirroring AWS KMS's `InvalidKeyUsageException`.
 
-- Malformed/truncated ciphertext → refuse
-- GCM tag mismatch → refuse with clear reason
-- key_name missing/revoked → refuse both operations
-- key_name has `key_usage = "SIGN_VERIFY"` → reject (mirrors AWS KMS `InvalidKeyUsageException`)
+**Acceptance Criteria:**
+*   `encrypt` followed by `decrypt` must return the exact original plaintext (round-trip test) across multiple data types (text, JSON, binary base64).
+*   Altering any single byte in the ciphertext → decrypt must fail clearly, 100% of the time.
+*   No request (encrypt/decrypt/list_keys) ever returns the real AES key.
 
-**Acceptance criteria:**
+#### 2.3. Named-Key Access Control
+**Security Guarantee:** A user cannot use another user's named key to encrypt/decrypt, even if they know the exact key name.
 
-- [ ] encrypt → decrypt round-trip returns exact plaintext across text/JSON/binary
-- [ ] Altering any ciphertext byte → decrypt fails 100% of the time
-- [ ] No request ever returns real AES key material
+**User Story:** As a user, I am guaranteed that only I can use my own named key to encrypt/decrypt, even if someone else knows the key's name.
 
----
+**Functional Flow:**
+1. Every named key is stored together with an `owner_email` (section 2.1).
+2. Every `encrypt`/`decrypt` request checks whether the email in the token matches the `owner_email` of the `key_name` being called.
+3. If they don't match → refuse, WITHOUT performing any encryption/decryption operation, returning a generic error (without disclosing whether that `key_name` exists).
+4. Log every denied access attempt along with the requester's email and the denied key_name.
 
-### 2.3 — Transit Engine: Named-Key Access Control
+**Error Cases to Handle:**
+*   Valid token but not the owner of `key_name` → `'PERMISSION_DENIED'`.
 
-**Security guarantee:** User cannot use another user's named key, even knowing its name.
+**Acceptance Criteria:**
+*   **Required test:** User A attempts to encrypt/decrypt using a `key_name` owned by user B → must be denied 100% of the time.
 
-**Flow:**
+#### 2.4. Sign & Verify as a Service
+**Security Guarantee:** The private signing key never leaves the server — exactly like the encryption key in 2.1. Verification must reject any message that was altered after signing, and any signature produced with a different key, without ever exposing the private key to do so.
 
-1. Every named key stores `owner_email`.
-2. Every encrypt/decrypt request checks token email vs. `owner_email`.
-3. Mismatch → refuse **before** any crypto operation, generic error (no existence disclosure).
-4. Log every denied attempt (requester email + denied key_name).
+**User Story:** As a user, I want to digitally sign a message with my own signing key, and let anyone verify that the signature is authentic and the message hasn't been tampered with, without ever handling the private key myself — modeled after AWS KMS's Sign / Verify APIs.
 
-**Acceptance criteria:**
+**Functional Flow:**
+1. Client calls `create_signing_key(key_name, signing_algorithm)` with a token → the system generates an asymmetric key pair (e.g., RSA-2048 for `RSASSA_PKCS1_V1_5_SHA_256`, or `ED25519`). The private key is encrypted with the DEK before being stored (same pattern as 2.1); the public key is stored so the server can verify later — it is still never exposed to a client that isn't authorized to see it.
+2. Client calls `sign(key_name, message_b64, message_type, token)`, where `message_type` is either `RAW` (the system hashes the message with SHA-256 first) or `DIGEST` (the client already sends a precomputed hash). The system checks ownership of `key_name`, signs using the private key in memory (decrypted only temporarily via the DEK), and returns the signature.
+3. Client calls `verify(key_name, message_b64, message_type, signature_b64, token)` → the system recomputes/uses the digest the same way as in `sign()`, checks the signature against the key's public component, and returns a structured result — `{key_name, signature_valid, signing_algorithm}` — mirroring the response shape of AWS KMS's Verify API, instead of silently assuming a signature is correct.
+4. Apply the same ownership-based access control as 2.1/2.3: only the key's owner may call `sign()`; the caller must also be the owner to call `verify()`.
 
-- [ ] **Required test:** User A using User B's key_name → denied 100% of the time
-
----
-
-### 2.4 — Transit Engine: Sign & Verify as a Service
-
-**Security guarantee:** Private signing key never leaves the server; tampered messages/cross-key signatures always fail verification.
-
-**Flow:**
-
-1. `create_signing_key(key_name, signing_algorithm, token)` → generate RSA-2048 or Ed25519 key pair; private key encrypted with DEK before storage; public key stored for server-side verification.
-2. `sign(key_name, message_b64, message_type, token)` — `message_type` is `RAW` (server hashes with SHA-256) or `DIGEST` (client pre-hashed). Check ownership → sign with private key (decrypted temporarily via DEK) → return signature.
-3. `verify(key_name, message_b64, message_type, signature_b64, token)` → recompute digest same way as sign → check against public key → return `{key_name, signature_valid, signing_algorithm}`.
-4. Same ownership-based access control as 2.1/2.3 applies to both `sign()` and `verify()` (mandatory scope: owner-only for both).
-
-**API:**
+**Input / Output:**
 
 | API | Input | Output |
 |---|---|---|
-| create_signing_key | key_name, signing_algorithm, token | confirmation |
-| sign | key_name, message (base64), message_type, token | signature (base64), key_name, signing_algorithm |
-| verify | key_name, message (base64), message_type, signature (base64), token | key_name, signature_valid (bool), signing_algorithm |
+| **create_signing_key** | key_name, signing_algorithm, token | confirmation |
+| **sign** | key_name, message (base64), message_type (RAW\|DIGEST), token | signature (base64), key_name, signing_algorithm |
+| **verify** | key_name, message (base64), message_type, signature (base64), token | key_name, signature_valid (boolean), signing_algorithm |
 
-**Data contract:**
-
+**Data Contract:**
 ```json
 {
   "key_name": "my-signing-key",
@@ -304,94 +284,76 @@ StudentID1_StudentID2_StudentID3/
   "key_usage": "SIGN_VERIFY",
   "signing_algorithm": "ED25519",
   "encrypted_private_key_b64": "<private key encrypted with the DEK>",
-  "public_key_b64": "<public key>"
+  "public_key_b64": "<public key, used internally by the server to verify>"
 }
 ```
 
-**Error handling:**
+**Error Cases to Handle:**
+*   `message_type = DIGEST` but the digest length doesn't match the expected hash output size → reject the request.
+*   `verify()` called with a `signing_algorithm` that doesn't match the one the key was created with → reject.
+*   `key_name` doesn't exist or has been revoked → refuse both sign and verify.
+*   `key_name` exists but its `key_usage` is `"ENCRYPT_DECRYPT"` (created in section 2.1), not `"SIGN_VERIFY"` → reject with a clear error, mirroring AWS KMS's `InvalidKeyUsageException`.
+*   Malformed or wrong-length signature passed to `verify()` → return `signature_valid: false` (or a clear rejection), never throw an unhandled exception.
 
-- `DIGEST` with wrong digest length → reject
-- `verify()` algorithm mismatch vs. key's creation algorithm → reject
-- key_name missing/revoked → refuse both sign/verify
-- key_name has `key_usage = "ENCRYPT_DECRYPT"` → reject (`InvalidKeyUsageException` pattern)
-- Malformed/wrong-length signature → return `signature_valid: false`, never an unhandled exception
-
-**Acceptance criteria:**
-
-- [ ] sign → verify on unmodified message → `signature_valid: true`, 100% of the time
-- [ ] Altering 1 byte of message before verify → `signature_valid: false`, 100% of the time
-- [ ] Signature from key A verified against key B → `signature_valid: false`
-- [ ] No API ever returns the raw private signing key
+**Acceptance Criteria:**
+*   `sign()` followed by `verify()` on the unmodified message must return `signature_valid: true`, 100% of the time.
+*   Altering a single byte of the message before calling `verify()` → `signature_valid` must be false, 100% of the time.
+*   Using a signature produced by one named key to `verify()` against a different named key → `signature_valid` must be false.
+*   No API ever returns the raw private signing key.
 
 ---
 
-## 5. Optional / Extra Credit (max +1.0 total, only after all 8 required sub-features are stable)
+## IV. Advanced Features (Optional — Extra Credit)
 
-| Feature | Credit |
+Should only be attempted after all 8 required sub-features in section III are running stably. Total extra credit from this section may not exceed 1.0 point out of 10.
+
+| Advanced Feature | Suggested Extra Credit |
 |---|---|
-| Full Policy/ACL system for sharing keys/secrets across users | +0.4 |
-| MFA (OTP/TOTP) for login | +0.2 |
-| Shamir's Secret Sharing for Master Passphrase (N shares, K threshold) | +0.5 |
-| Key rotation for Transit (versioned keys, decrypt old ciphertext) | +0.4 |
-| KV versioning (history of overwrites) | +0.3 |
-| Tamper-evident audit log (hash-chained) | +0.3 |
-| Open `verify()` to any authenticated user via grant model | +0.3 |
+| Sharing named keys/secrets across multiple users via a full Policy/ACL system | +0.4 |
+| MFA (OTP/TOTP) for the login step in section 0.2 | +0.2 |
+| Shamir's Secret Sharing for section 0.1 (replacing a single Master Passphrase with N key shares, requiring K shares) | +0.5 |
+| Key rotation for Transit (versioned named keys, still able to decrypt old ciphertext) | +0.4 |
+| KV versioning (keeping a history of overwrites) | +0.3 |
+| Tamper-evident audit log (hash-chained, detects log tampering) | +0.3 |
+| Opening `verify()` in 2.4 to any authenticated user, not just the key owner (with an explicit share/grant model) | +0.3 |
 
 ---
 
-## 6. Suggested Technology
+## V. Suggested Technology
 
-| Task | Library |
+| Task | Suggested Python Library |
 |---|---|
-| Storing KV / named keys / users | `sqlite3` or JSON |
-| Password hashing | `bcrypt`, `argon2-cffi` |
-| KDF for Master Passphrase | `argon2-cffi` or `hashlib.pbkdf2_hmac` |
-| AES-256-GCM | `cryptography` (AESGCM) or `pycryptodome` |
-| Asymmetric signing (RSA/Ed25519) | `cryptography` (`rsa`, `ed25519`) |
-| CSPRNG (nonce, key, salt) | `secrets`, `os.urandom` |
-| REST API (optional) | FastAPI or Flask |
-| Testing | `pytest`, GitHub Actions |
+| **Storing KV / named keys / users** | `sqlite3` (standard library) or JSON |
+| **Password hashing** | `bcrypt`, `argon2-cffi` |
+| **Key derivation from the Master Passphrase (KDF)** | `argon2-cffi` or `hashlib.pbkdf2_hmac` |
+| **AES-256-GCM encryption** | `cryptography` (AESGCM) or `pycryptodome` |
+| **Asymmetric signing (RSA / ED25519)** | `cryptography` (rsa, ed25519 modules) |
+| **Cryptographically secure random generation** | `secrets`, `os.urandom` |
+| **REST API (optional)** | FastAPI or Flask |
+| **Unit testing / CI (optional)** | `pytest`, GitHub Actions |
 
 ---
 
-## 7. Submission Checklist
+## VI. Submission Must Include
 
-- [ ] Full source code in the required module structure, with README.md
-- [ ] Report (PDF): team name, student IDs, task assignment, architecture diagram, technical explanation of 0.1/0.2/1.1/1.2/2.1/2.2/2.3/2.4, demo screenshots, optional features completed
-- [ ] Demo video (3–5 min, recommended): unlock → write/read secret → cross-user denial → create named key → encrypt/decrypt → cross-user key denial → sign → verify (valid) → verify (tampered, invalid)
-- [ ] Test data files: an encrypted KV data file, sample Transit ciphertext
-- [ ] Zipped as `StudentID1_StudentID2_StudentID3.zip`
+*   Full source code, organized into modules as described in section II, with a `README.md`.
+*   **Report:** Team name, student IDs, task assignment; architecture diagram; technical explanation for sections 0.1, 0.2, 1.1, 1.2, 2.1, 2.2, 2.3, 2.4; screenshots of the demo; optional features completed.
+*   **Demo video:** Unlock, write/read a secret, attempting to access another user's secret (denied), creating a named key, encrypt/decrypt, attempting to use another user's key (denied), sign a message, verify it (valid), then verify a tampered message (invalid).
+*   **Test data files:** An encrypted KV data file, sample ciphertext from Transit.
 
 ---
 
-## 8. Grading Rubric (10 pts total)
+## VII. Grading Rubric
 
-| # | Category | Criteria | Points |
+| No. | Category | Detailed Content & Grading Criteria | Points |
 |---|---|---|---|
-| 1 | 0.1 Init & Unlock | Correct KDF, defaults to locked after restart, no plaintext DEK leaked | 1.0 |
-| 2 | 0.2 User Authentication | Correct password hashing, session token, 5-fail lockout | 1.0 |
-| 3 | 1.1 KV Encrypted-at-Rest | Correct AEAD, detects tampering, no plaintext leaked | 1.25 |
-| 4 | 1.2 KV Access Control | Blocks 100% of unauthorized cross-user access | 1.0 |
-| 5 | 2.1 Transit Key Management | Named key never returned in plaintext | 1.0 |
-| 6 | 2.2 Transit Encrypt/Decrypt | Correct round-trip, detects tampered ciphertext | 1.25 |
-| 7 | 2.3 Transit Access Control | Blocks 100% of cross-user key use | 1.0 |
-| 8 | 2.4 Sign & Verify | Correct round-trip, rejects tampered/cross-key 100% | 1.0 |
-| 9 | Report, README, task assignment | Clear, complete, well-illustrated, run instructions | 0.75 |
-| 10 | Product Demo | Clear demo incl. denied-access and sign/verify cases | 0.75 |
-
----
-
-## 9. Recommended Build Order
-
-Dependency chain — each stage requires the previous to be working and tested:
-
-```
-0.1 Init/Unlock → 0.2 Auth → 1.1 KV crypto → 1.2 KV ACL →
-2.1 Key mgmt → 2.2 Encrypt/Decrypt → 2.3 Transit ACL → 2.4 Sign/Verify
-```
-
-1. `core/` — KDF, AEAD wrapper, vault lock/unlock state machine
-2. `auth/` — register, login, session tokens, failed-attempt lockout
-3. `kv/` — 1.1 (encrypt/decrypt storage) then 1.2 (ownership check)
-4. `transit/` — 2.1 → 2.2 → 2.3 → 2.4, same pattern each time (mechanism → ownership check → usage-type validation)
-5. Wrap in CLI or FastAPI routes; write required negative tests (tampered byte, cross-user access, cross-key verify)
+| 1 | **0.1 — Init & Unlock** | Correct KDF, defaults to locked after restart, no plaintext DEK leaked | 1.0 |
+| 2 | **0.2 — User Authentication** | Correct password hashing, session token, temporary lockout after 5 failed attempts | 1.0 |
+| 3 | **1.1 — KV Encrypted-at-Rest** | Correct AEAD, detects tampered on-disk data, no plaintext leaked | 1.25 |
+| 4 | **1.2 — KV Access Control** | Blocks 100% of unauthorized cross-user access | 1.0 |
+| 5 | **2.1 — Transit Key Management** | Named key never returned in plaintext via API | 1.0 |
+| 6 | **2.2 — Transit Encrypt/Decrypt** | Correct round-trip, detects tampered ciphertext | 1.25 |
+| 7 | **2.3 — Transit Access Control** | Blocks 100% of attempts to use another user's key | 1.0 |
+| 8 | **2.4 — Sign & Verify** | Correct round-trip, rejects tampered messages and cross-key signatures 100% of the time | 1.0 |
+| 9 | **Report, README, task assignment** | Clear, complete, well-illustrated, with run instructions | 0.75 |
+| 10 | **Product Demo** | Clear demo, including denied-access cases and sign/verify cases | 0.75 |
