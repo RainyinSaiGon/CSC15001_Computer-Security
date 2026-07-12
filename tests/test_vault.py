@@ -147,3 +147,51 @@ def test_vault_locked_refuses_operations(client):
     response_locked = client.get("/vault/protected-test")
     assert response_locked.status_code == 400
     assert response_locked.json()["detail"] == "VAULT_LOCKED"
+
+def test_vault_restart_behavior(tmp_path, monkeypatch):
+    """
+    8. test_vault_restart_behavior:
+    Simulate a complete server restart:
+    - Create a metadata file in one process run.
+    - Start a fresh client/process in a new test with the same data directory.
+    - Verify that status is 'locked' initially.
+    - Verify that correct unlock works.
+    """
+    # 1. First run: Initialize the vault
+    monkeypatch.setenv("VAULT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("VAULT_LOG_FILE", str(tmp_path / "vault.log"))
+    
+    with TestClient(app) as client1:
+        res = client1.post("/vault/init", json={"master_passphrase": "a_very_strong_master_passphrase_123!"})
+        assert res.status_code == 200
+        assert res.json()["status"] == "unlocked"
+        
+        # Verify it works
+        resp = client1.get("/vault/protected-test")
+        assert resp.status_code == 200
+        
+        # Wiping the in-memory variable mocks a process restart / memory reset
+        from src.core import vault
+        vault._IN_MEMORY_DEK = None
+        
+    # 2. Restart run: Create a fresh TestClient, referencing the same data directory
+    with TestClient(app) as client2:
+        # Since _IN_MEMORY_DEK was wiped, it should start in a locked state
+        status_resp = client2.get("/vault/status")
+        assert status_resp.status_code == 200
+        assert status_resp.json()["status"] == "locked"
+        
+        # Protected endpoints must refuse
+        protected_resp = client2.get("/vault/protected-test")
+        assert protected_resp.status_code == 400
+        assert protected_resp.json()["detail"] == "VAULT_LOCKED"
+        
+        # Must unlock with the correct passphrase
+        unlock_resp = client2.post("/vault/unlock", json={"master_passphrase": "a_very_strong_master_passphrase_123!"})
+        assert unlock_resp.status_code == 200
+        assert unlock_resp.json()["status"] == "unlocked"
+        
+        # Protected endpoints must work again
+        resp_after_unlock = client2.get("/vault/protected-test")
+        assert resp_after_unlock.status_code == 200
+
