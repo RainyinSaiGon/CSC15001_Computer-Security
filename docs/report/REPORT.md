@@ -76,3 +76,44 @@ To maximize security for the root master passphrase, Mini Vault implements guide
 *   **Length over Complexity:** Enforces a minimum length of 14 characters, encouraging long multi-word passphrases (e.g. `correct-horse-battery-staple`) which possess high natural entropy over short, complex passwords with forced special characters.
 *   **Default Prevention:** Explicitly blocks common default strings (like `master_passphrase`, `passwordpassword`, or `adminadmin12345`) to prevent deployment with placeholder credentials.
 
+---
+
+### Section 0.2 — User Identity Authentication
+
+#### 1. Password Hashing (bcrypt)
+User passphrases are hashed using **bcrypt** (via the `bcrypt` Python library), which is a dedicated password-hashing algorithm designed to be computationally expensive, making brute-force attacks impractical.
+*   **Hashing**: `bcrypt.hashpw(password, bcrypt.gensalt())` generates a unique salt and hash per user.
+*   **Verification**: `bcrypt.checkpw(password, stored_hash)` performs constant-time comparison, resistant to timing attacks.
+*   **Why not SHA?** SHA-256/SHA-512 are general-purpose hash functions optimized for speed — the exact opposite of what password storage needs. bcrypt's configurable work factor makes it deliberately slow.
+
+#### 2. User Registration
+*   **Email Validation**: Basic format check ensures the email contains `@` and a domain with a dot (regex: `^[^@\s]+@[^@\s]+\.[^@\s]+$`).
+*   **Password Strength**: Minimum 8 characters for user passphrases (distinct from the 14-character requirement for the root master passphrase).
+*   **Password Confirmation**: The `confirm_password` field must match `password` exactly.
+*   **Uniqueness**: Checked via SQLite `PRIMARY KEY` constraint on the `email` column.
+
+#### 3. Session Token Management
+*   **Generation**: 32-byte cryptographically secure random hex token (`secrets.token_hex(32)`), producing a 64-character string.
+*   **Storage**: In-memory dictionary mapping `token → {email, expires_at}`. Sessions are intentionally volatile — they are cleared on server restart, forcing re-authentication.
+*   **Expiry**: 30 minutes from the time of issue. Every protected API call validates the token and checks expiry.
+*   **Authorization Header**: Tokens are passed as `Authorization: Bearer <token>` in HTTP headers, following standard REST conventions.
+
+#### 4. Account Lockout Mechanism
+*   **Trigger**: 5 consecutive failed login attempts.
+*   **Duration**: 5 minutes (300 seconds), enforced via a `lockout_until` Unix timestamp stored in the SQLite `users` table.
+*   **Enforcement**: During the lockout period, **all** login attempts are rejected immediately — even with the correct password — before any password verification occurs. This prevents timing-based attacks from inferring whether a password is correct.
+*   **Reset**: A successful login resets the `failed_attempts` counter to 0 and clears `lockout_until`.
+
+#### 5. Database Schema
+User accounts are stored in an SQLite database (`data/vault.db`) with the following schema:
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    email TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    failed_attempts INTEGER DEFAULT 0,
+    lockout_until REAL DEFAULT 0.0  -- Unix timestamp
+);
+```
+
+#### 6. Time Abstraction for Testability
+All time-dependent logic uses a `_get_current_time()` helper function that wraps `time.time()`. This design allows tests to monkeypatch the function to simulate time travel (e.g., fast-forwarding past a lockout period or session expiry) without relying on `time.sleep()`, which would make tests slow and non-deterministic.

@@ -2,17 +2,37 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 from main import app
+from src.storage import database
+from src.auth import auth
+
+
+def _register_and_login(client):
+    """Helper: register a test user and return a valid session token."""
+    client.post("/auth/register", json={
+        "email": "testuser@example.com",
+        "password": "securepass123",
+        "confirm_password": "securepass123"
+    })
+    resp = client.post("/auth/login", json={
+        "email": "testuser@example.com",
+        "password": "securepass123"
+    })
+    return resp.json()["session_token"]
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     # Set the vault data directory to a temp path for isolated testing
     monkeypatch.setenv("VAULT_DATA_DIR", str(tmp_path))
-    # Ensure any logs go to the temp path as well
     monkeypatch.setenv("VAULT_LOG_FILE", str(tmp_path / "vault.log"))
+    database.reset_connection()
+    auth.clear_sessions()
     
-    # Return the TestClient configured with this isolated environment
     with TestClient(app) as c:
         yield c
+    
+    database.reset_connection()
+    auth.clear_sessions()
 
 def test_vault_status_uninitialized(client):
     """
@@ -127,7 +147,7 @@ def test_vault_locked_refuses_operations(client):
     Ensure that calling mock operations (Feature 1/2 protected endpoints)
     returns a 'VAULT_LOCKED' error when the vault is locked or uninitialized.
     """
-    # 1. Check when uninitialized
+    # 1. Check when uninitialized — vault check runs before token check
     response = client.get("/vault/protected-test")
     assert response.status_code == 400
     assert response.json()["detail"] == "VAULT_LOCKED"
@@ -135,16 +155,20 @@ def test_vault_locked_refuses_operations(client):
     # 2. Initialize (becomes unlocked)
     client.post("/vault/init", json={"master_passphrase": "a_very_strong_master_passphrase_123!"})
     
-    # Test that it works when unlocked
-    response_unlocked = client.get("/vault/protected-test")
+    # Register and login to get a valid token
+    token = _register_and_login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Test that it works when unlocked WITH a valid token
+    response_unlocked = client.get("/vault/protected-test", headers=headers)
     assert response_unlocked.status_code == 200
     assert response_unlocked.json() == {"message": "success"}
     
     # 3. Lock the vault
     client.post("/vault/lock")
     
-    # Test that it refuses when locked
-    response_locked = client.get("/vault/protected-test")
+    # Test that it refuses when locked (even with a valid token)
+    response_locked = client.get("/vault/protected-test", headers=headers)
     assert response_locked.status_code == 400
     assert response_locked.json()["detail"] == "VAULT_LOCKED"
 
@@ -160,14 +184,19 @@ def test_vault_restart_behavior(tmp_path, monkeypatch):
     # 1. First run: Initialize the vault
     monkeypatch.setenv("VAULT_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("VAULT_LOG_FILE", str(tmp_path / "vault.log"))
+    database.reset_connection()
+    auth.clear_sessions()
     
     with TestClient(app) as client1:
         res = client1.post("/vault/init", json={"master_passphrase": "a_very_strong_master_passphrase_123!"})
         assert res.status_code == 200
         assert res.json()["status"] == "unlocked"
         
-        # Verify it works
-        resp = client1.get("/vault/protected-test")
+        # Register a user and get a token to test protected endpoint
+        token = _register_and_login(client1)
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        resp = client1.get("/vault/protected-test", headers=headers)
         assert resp.status_code == 200
         
         # Wiping the in-memory variable mocks a process restart / memory reset
@@ -181,8 +210,8 @@ def test_vault_restart_behavior(tmp_path, monkeypatch):
         assert status_resp.status_code == 200
         assert status_resp.json()["status"] == "locked"
         
-        # Protected endpoints must refuse
-        protected_resp = client2.get("/vault/protected-test")
+        # Protected endpoints must refuse (vault locked takes priority)
+        protected_resp = client2.get("/vault/protected-test", headers=headers)
         assert protected_resp.status_code == 400
         assert protected_resp.json()["detail"] == "VAULT_LOCKED"
         
@@ -191,7 +220,6 @@ def test_vault_restart_behavior(tmp_path, monkeypatch):
         assert unlock_resp.status_code == 200
         assert unlock_resp.json()["status"] == "unlocked"
         
-        # Protected endpoints must work again
-        resp_after_unlock = client2.get("/vault/protected-test")
+        # Protected endpoints must work again with the same token
+        resp_after_unlock = client2.get("/vault/protected-test", headers=headers)
         assert resp_after_unlock.status_code == 200
-
