@@ -37,6 +37,20 @@ class EncryptRequest(BaseModel):
 class DecryptRequest(BaseModel):
     ciphertext: str
 
+class CreateSigningKeyRequest(BaseModel):
+    key_name: str
+    signing_algorithm: str
+
+class SignRequest(BaseModel):
+    message_b64: str
+    message_type: str
+
+class VerifyRequest(BaseModel):
+    message_b64: str
+    message_type: str
+    signature_b64: str
+    signing_algorithm: str | None = None  # Optional: if provided, must match the key's stored algorithm
+
 
 # ---------------------------------------------------------------------------
 # Helper: extract and validate session token from Authorization header
@@ -47,13 +61,18 @@ def _require_session(authorization: str | None) -> str:
     Parse 'Bearer <token>' from the Authorization header and validate it.
     Returns the authenticated user's email.
     Raises HTTPException 401 if missing, malformed, invalid, or expired.
+
+    All transit endpoints call this helper first so that:
+      1. Unauthenticated requests are rejected before any database query.
+      2. The returned email is used as the owner_email for key ownership checks,
+         ensuring a token can only operate on its own user's keys.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="UNAUTHENTICATED"
         )
-    token = authorization[7:]  # strip "Bearer "
+    token = authorization[7:]  # strip "Bearer " prefix
     try:
         email = auth.validate_session(token)
         return email
@@ -201,14 +220,18 @@ def create_transit_key(
     authorization: str | None = Header(default=None)
 ):
     """Create a new named key for encryption/decryption."""
+    # Dual-gate: vault lock check first (fast), then session check (involves DB lookup).
+    # If the vault is locked, there is no DEK to wrap new keys — fail early.
     if core.get_status() != "unlocked":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="VAULT_LOCKED"
         )
-    
+
     owner_email = _require_session(authorization)
     dek = core.get_dek()
+    # Defensive double-check: get_dek() could return None if vault was locked
+    # between the status check above and this call (TOCTOU window).
     if dek is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -359,6 +382,121 @@ def decrypt_transit_data(
                 detail="INVALID_KEY_USAGE"
             )
         elif err in ("INVALID_CIPHERTEXT", "DECRYPTION_FAILED"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=err
+        )
+
+@app.post("/transit/keys/signing")
+def create_transit_signing_key(
+    req: CreateSigningKeyRequest,
+    authorization: str | None = Header(default=None)
+):
+    """Create a new named signing key."""
+    if core.get_status() != "unlocked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    owner_email = _require_session(authorization)
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    try:
+        res = transit.create_signing_key(req.key_name, req.signing_algorithm, owner_email, dek)
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err in ("INVALID_KEY_NAME", "INVALID_SIGNING_ALGORITHM", "KEY_ALREADY_EXISTS"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=err
+        )
+
+@app.post("/transit/sign/{key_name}")
+def sign_transit_data(
+    key_name: str,
+    req: SignRequest,
+    authorization: str | None = Header(default=None)
+):
+    """Sign data using a named key."""
+    if core.get_status() != "unlocked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    owner_email = _require_session(authorization)
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    try:
+        res = transit.sign(key_name, req.message_b64, req.message_type, owner_email, dek)
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PERMISSION_DENIED"
+            )
+        elif err in ("INVALID_KEY_USAGE", "INVALID_MESSAGE_TYPE", "INVALID_MESSAGE_BASE64", "INVALID_DIGEST"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=err
+        )
+
+@app.post("/transit/verify/{key_name}")
+def verify_transit_data(
+    key_name: str,
+    req: VerifyRequest,
+    authorization: str | None = Header(default=None)
+):
+    """Verify signature using a named key."""
+    if core.get_status() != "unlocked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    owner_email = _require_session(authorization)
+    try:
+        res = transit.verify(
+            key_name, req.message_b64, req.message_type,
+            req.signature_b64, owner_email,
+            expected_signing_algorithm=req.signing_algorithm
+        )
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PERMISSION_DENIED"
+            )
+        elif err in ("INVALID_KEY_USAGE", "INVALID_MESSAGE_TYPE", "INVALID_MESSAGE_BASE64",
+                     "INVALID_DIGEST", "ALGORITHM_MISMATCH"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=err

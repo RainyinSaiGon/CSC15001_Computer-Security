@@ -454,10 +454,12 @@ def test_decrypt_invalid_key_usage(unlocked_client):
     conn = database.get_connection()
     conn.execute(
         """
-        INSERT INTO transit_keys (key_name, owner_email, key_usage, encrypted_key_material_b64)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO transit_keys (key_name, owner_email, key_usage, encrypted_key_material_b64, signing_algorithm, public_key_b64)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        ("signing-key", "alice@example.com", "SIGN_VERIFY", base64.b64encode(b"dummy_encrypted_key_material").decode("utf-8"))
+        ("signing-key", "alice@example.com", "SIGN_VERIFY",
+         base64.b64encode(b"dummy_encrypted_key_material").decode("utf-8"),
+         "ED25519", "dummy_public_key_b64")
     )
     conn.commit()
 
@@ -481,3 +483,303 @@ def test_decrypt_invalid_key_usage(unlocked_client):
     assert dec_resp.status_code == 400
     assert dec_resp.json()["detail"] == "INVALID_KEY_USAGE"
 
+
+def test_create_signing_key_success(unlocked_client):
+    """Creating a signing key successfully registers and returns the correct data contract."""
+    token = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    for algo in ["RSASSA_PKCS1_V1_5_SHA_256", "ED25519"]:
+        key_name = f"sign-key-{algo}"
+        resp = unlocked_client.post(
+            "/transit/keys/signing",
+            json={"key_name": key_name, "signing_algorithm": algo},
+            headers=headers
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["key_name"] == key_name
+        assert data["owner_email"] == "alice@example.com"
+        assert data["key_usage"] == "SIGN_VERIFY"
+        assert data["signing_algorithm"] == algo
+        # Neither the public key nor the encrypted/raw private key should be in the response
+        assert "public_key_b64" not in data
+        assert "encrypted_private_key_b64" not in data
+        assert "private_key" not in str(data).lower()
+
+    # Verify keys exist in list response
+    list_resp = unlocked_client.get("/transit/keys", headers=headers)
+    assert list_resp.status_code == 200
+    keys = list_resp.json()
+    assert len(keys) == 2
+    assert {k["key_name"] for k in keys} == {"sign-key-RSASSA_PKCS1_V1_5_SHA_256", "sign-key-ED25519"}
+    assert {k["key_usage"] for k in keys} == {"SIGN_VERIFY"}
+    assert {k["signing_algorithm"] for k in keys} == {"RSASSA_PKCS1_V1_5_SHA_256", "ED25519"}
+
+
+def test_sign_verify_success(unlocked_client):
+    """Test signing and verification round-trip for both algorithms and message types (RAW, DIGEST)."""
+    token = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    algos = ["RSASSA_PKCS1_V1_5_SHA_256", "ED25519"]
+    for algo in algos:
+        key_name = f"key-{algo}"
+        unlocked_client.post(
+            "/transit/keys/signing",
+            json={"key_name": key_name, "signing_algorithm": algo},
+            headers=headers
+        )
+
+        # Message type RAW
+        raw_msg = b"Hello world! This is a signed message."
+        raw_msg_b64 = base64.b64encode(raw_msg).decode("utf-8")
+        
+        sign_resp = unlocked_client.post(
+            f"/transit/sign/{key_name}",
+            json={"message_b64": raw_msg_b64, "message_type": "RAW"},
+            headers=headers
+        )
+        assert sign_resp.status_code == 200
+        sig_data = sign_resp.json()
+        assert "signature" in sig_data
+        assert sig_data["key_name"] == key_name
+        assert sig_data["signing_algorithm"] == algo
+
+        # Verify RAW
+        verify_resp = unlocked_client.post(
+            f"/transit/verify/{key_name}",
+            json={
+                "message_b64": raw_msg_b64,
+                "message_type": "RAW",
+                "signature_b64": sig_data["signature"]
+            },
+            headers=headers
+        )
+        assert verify_resp.status_code == 200
+        ver_data = verify_resp.json()
+        assert ver_data["signature_valid"] is True
+        assert ver_data["key_name"] == key_name
+        assert ver_data["signing_algorithm"] == algo
+
+        # Verify RAW with tampered message
+        tampered_msg_b64 = base64.b64encode(b"Hello world! This is a signed message..").decode("utf-8")
+        verify_tampered = unlocked_client.post(
+            f"/transit/verify/{key_name}",
+            json={
+                "message_b64": tampered_msg_b64,
+                "message_type": "RAW",
+                "signature_b64": sig_data["signature"]
+            },
+            headers=headers
+        )
+        assert verify_tampered.status_code == 200
+        assert verify_tampered.json()["signature_valid"] is False
+
+        # Message type DIGEST (precomputed 32-byte hash)
+        import hashlib
+        digest = hashlib.sha256(raw_msg).digest()
+        digest_b64 = base64.b64encode(digest).decode("utf-8")
+
+        sign_digest_resp = unlocked_client.post(
+            f"/transit/sign/{key_name}",
+            json={"message_b64": digest_b64, "message_type": "DIGEST"},
+            headers=headers
+        )
+        assert sign_digest_resp.status_code == 200
+        sig_digest_data = sign_digest_resp.json()
+
+        # Verify DIGEST
+        verify_digest_resp = unlocked_client.post(
+            f"/transit/verify/{key_name}",
+            json={
+                "message_b64": digest_b64,
+                "message_type": "DIGEST",
+                "signature_b64": sig_digest_data["signature"]
+            },
+            headers=headers
+        )
+        assert verify_digest_resp.status_code == 200
+        assert verify_digest_resp.json()["signature_valid"] is True
+
+
+def test_sign_verify_access_control(unlocked_client):
+    """Alice's signing key cannot be used by Bob to sign or verify, raising PERMISSION_DENIED."""
+    token_alice = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    token_bob = _register_and_login(unlocked_client, "bob@example.com", "securepass456")
+
+    # Alice creates a key
+    unlocked_client.post(
+        "/transit/keys/signing",
+        json={"key_name": "alice-signing-key", "signing_algorithm": "ED25519"},
+        headers={"Authorization": f"Bearer {token_alice}"}
+    )
+
+    msg_b64 = base64.b64encode(b"hello").decode("utf-8")
+
+    # Bob tries to sign
+    sign_resp = unlocked_client.post(
+        "/transit/sign/alice-signing-key",
+        json={"message_b64": msg_b64, "message_type": "RAW"},
+        headers={"Authorization": f"Bearer {token_bob}"}
+    )
+    assert sign_resp.status_code == 403
+    assert sign_resp.json()["detail"] == "PERMISSION_DENIED"
+
+    # Alice signs successfully
+    alice_sign_resp = unlocked_client.post(
+        "/transit/sign/alice-signing-key",
+        json={"message_b64": msg_b64, "message_type": "RAW"},
+        headers={"Authorization": f"Bearer {token_alice}"}
+    )
+    sig_b64 = alice_sign_resp.json()["signature"]
+
+    # Bob tries to verify
+    verify_resp = unlocked_client.post(
+        "/transit/verify/alice-signing-key",
+        json={
+            "message_b64": msg_b64,
+            "message_type": "RAW",
+            "signature_b64": sig_b64
+        },
+        headers={"Authorization": f"Bearer {token_bob}"}
+    )
+    assert verify_resp.status_code == 403
+    assert verify_resp.json()["detail"] == "PERMISSION_DENIED"
+
+
+def test_sign_verify_invalid_usage_and_inputs(unlocked_client):
+    """Verify that encrypt keys cannot be used for signing, and invalid formats are handled."""
+    token = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Create encrypt key
+    unlocked_client.post("/transit/keys", json={"key_name": "enc-key"}, headers=headers)
+
+    # Try to sign with encrypt key
+    msg_b64 = base64.b64encode(b"hello").decode("utf-8")
+    resp_sign = unlocked_client.post(
+        "/transit/sign/enc-key",
+        json={"message_b64": msg_b64, "message_type": "RAW"},
+        headers=headers
+    )
+    assert resp_sign.status_code == 400
+    assert resp_sign.json()["detail"] == "INVALID_KEY_USAGE"
+
+    # 2. Create signing key
+    unlocked_client.post(
+        "/transit/keys/signing",
+        json={"key_name": "sign-key", "signing_algorithm": "ED25519"},
+        headers=headers
+    )
+
+    # Invalid digest length (expected 32 bytes)
+    short_digest = base64.b64encode(b"too-short").decode("utf-8")
+    resp_digest = unlocked_client.post(
+        "/transit/sign/sign-key",
+        json={"message_b64": short_digest, "message_type": "DIGEST"},
+        headers=headers
+    )
+    assert resp_digest.status_code == 400
+    assert resp_digest.json()["detail"] == "INVALID_DIGEST"
+
+    # Malformed signature passed to verify -> return signature_valid: false
+    resp_ver_malformed = unlocked_client.post(
+        "/transit/verify/sign-key",
+        json={
+            "message_b64": msg_b64,
+            "message_type": "RAW",
+            "signature_b64": "not-base64!!!"
+        },
+        headers=headers
+    )
+    assert resp_ver_malformed.status_code == 200
+    assert resp_ver_malformed.json()["signature_valid"] is False
+
+
+def test_cross_key_signature_is_invalid(unlocked_client):
+    """Acceptance criteria: Signature from key-A must not verify against key-B."""
+    token = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Create two independent ED25519 signing keys
+    for kname in ["key-a", "key-b"]:
+        unlocked_client.post(
+            "/transit/keys/signing",
+            json={"key_name": kname, "signing_algorithm": "ED25519"},
+            headers=headers
+        )
+
+    msg_b64 = base64.b64encode(b"hello cross-key").decode("utf-8")
+
+    # Sign with key-a
+    sign_resp = unlocked_client.post(
+        "/transit/sign/key-a",
+        json={"message_b64": msg_b64, "message_type": "RAW"},
+        headers=headers
+    )
+    sig_a = sign_resp.json()["signature"]
+
+    # Verify against key-a: must be valid
+    ver_a = unlocked_client.post(
+        "/transit/verify/key-a",
+        json={"message_b64": msg_b64, "message_type": "RAW", "signature_b64": sig_a},
+        headers=headers
+    )
+    assert ver_a.status_code == 200
+    assert ver_a.json()["signature_valid"] is True
+
+    # Verify against key-b using key-a's signature: must be False
+    ver_b = unlocked_client.post(
+        "/transit/verify/key-b",
+        json={"message_b64": msg_b64, "message_type": "RAW", "signature_b64": sig_a},
+        headers=headers
+    )
+    assert ver_b.status_code == 200
+    assert ver_b.json()["signature_valid"] is False
+
+
+def test_verify_algorithm_mismatch(unlocked_client):
+    """verify() with a signing_algorithm that doesn't match the key's must be rejected."""
+    token = _register_and_login(unlocked_client, "alice@example.com", "securepass123")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Create an ED25519 signing key
+    unlocked_client.post(
+        "/transit/keys/signing",
+        json={"key_name": "ed-key", "signing_algorithm": "ED25519"},
+        headers=headers
+    )
+
+    msg_b64 = base64.b64encode(b"test algo mismatch").decode("utf-8")
+
+    sign_resp = unlocked_client.post(
+        "/transit/sign/ed-key",
+        json={"message_b64": msg_b64, "message_type": "RAW"},
+        headers=headers
+    )
+    sig_b64 = sign_resp.json()["signature"]
+
+    # Verify with correct algorithm: must succeed
+    ver_ok = unlocked_client.post(
+        "/transit/verify/ed-key",
+        json={
+            "message_b64": msg_b64, "message_type": "RAW",
+            "signature_b64": sig_b64, "signing_algorithm": "ED25519"
+        },
+        headers=headers
+    )
+    assert ver_ok.status_code == 200
+    assert ver_ok.json()["signature_valid"] is True
+
+    # Verify with wrong algorithm: must be rejected with ALGORITHM_MISMATCH
+    ver_mismatch = unlocked_client.post(
+        "/transit/verify/ed-key",
+        json={
+            "message_b64": msg_b64, "message_type": "RAW",
+            "signature_b64": sig_b64, "signing_algorithm": "RSASSA_PKCS1_V1_5_SHA_256"
+        },
+        headers=headers
+    )
+    assert ver_mismatch.status_code == 400
+    assert ver_mismatch.json()["detail"] == "ALGORITHM_MISMATCH"
