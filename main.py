@@ -31,6 +31,12 @@ class LoginRequest(BaseModel):
 class CreateKeyRequest(BaseModel):
     key_name: str
 
+class EncryptRequest(BaseModel):
+    plaintext_b64: str
+
+class DecryptRequest(BaseModel):
+    ciphertext: str
+
 
 # ---------------------------------------------------------------------------
 # Helper: extract and validate session token from Authorization header
@@ -265,6 +271,97 @@ def revoke_transit_key(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="KEY_NOT_FOUND"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=err
+        )
+
+@app.post("/transit/encrypt/{key_name}")
+def encrypt_transit_data(
+    key_name: str,
+    req: EncryptRequest,
+    authorization: str | None = Header(default=None)
+):
+    """Encrypt data using a named key."""
+    if core.get_status() != "unlocked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    owner_email = _require_session(authorization)
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    try:
+        ciphertext = transit.encrypt(key_name, req.plaintext_b64, owner_email, dek)
+        return {"ciphertext": ciphertext}
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PERMISSION_DENIED"
+            )
+        elif err == "INVALID_KEY_USAGE":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_KEY_USAGE"
+            )
+        elif err == "INVALID_PLAINTEXT_BASE64":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_PLAINTEXT_BASE64"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=err
+        )
+
+@app.post("/transit/decrypt")
+def decrypt_transit_data(
+    req: DecryptRequest,
+    authorization: str | None = Header(default=None)
+):
+    """Decrypt data using a named key."""
+    if core.get_status() != "unlocked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    owner_email = _require_session(authorization)
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="VAULT_LOCKED"
+        )
+    
+    try:
+        plaintext_b64 = transit.decrypt(req.ciphertext, owner_email, dek)
+        return {"plaintext_b64": plaintext_b64}
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PERMISSION_DENIED"
+            )
+        elif err == "INVALID_KEY_USAGE":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_KEY_USAGE"
+            )
+        elif err in ("INVALID_CIPHERTEXT", "DECRYPTION_FAILED"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err
             )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -89,3 +89,129 @@ def revoke_key(key_name: str, owner_email: str) -> None:
         (owner_email, key_name)
     )
     conn.commit()
+
+
+def encrypt(key_name: str, plaintext_b64: str, owner_email: str, dek: bytes | None) -> str:
+    """
+    Encrypt base64-encoded plaintext using a named key.
+    1. Validate vault is unlocked.
+    2. Query key.
+    3. Check ownership. If not matching, log access denial and raise ValueError("PERMISSION_DENIED").
+    4. Check key usage. If not ENCRYPT_DECRYPT, raise ValueError("INVALID_KEY_USAGE").
+    5. Decrypt named key using DEK.
+    6. Encrypt plaintext using AES-256-GCM.
+    7. Return formatted ciphertext.
+    """
+    from src.storage import disk
+
+    if dek is None:
+        raise ValueError("VAULT_LOCKED")
+
+    if not key_name or not key_name.strip():
+        raise ValueError("PERMISSION_DENIED")
+
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT * FROM transit_keys WHERE key_name = ?",
+        (key_name,)
+    ).fetchone()
+
+    # Access control: If key doesn't exist at all, or belongs to another user
+    if row is None or row["owner_email"] != owner_email:
+        disk.log_denied_access(owner_email, "key", key_name)
+        raise ValueError("PERMISSION_DENIED")
+
+    if row["key_usage"] != "ENCRYPT_DECRYPT":
+        raise ValueError("INVALID_KEY_USAGE")
+
+    # Decrypt the AES key material with the DEK
+    encrypted_key_bytes = base64.b64decode(row["encrypted_key_material_b64"])
+    key_nonce = encrypted_key_bytes[:12]
+    key_ciphertext = encrypted_key_bytes[12:]
+    
+    aesgcm_dek = AESGCM(dek)
+    raw_key = aesgcm_dek.decrypt(key_nonce, key_ciphertext, None)
+
+    # Decode plaintext
+    try:
+        plaintext = base64.b64decode(plaintext_b64)
+    except Exception:
+        raise ValueError("INVALID_PLAINTEXT_BASE64")
+
+    # Generate a fresh random nonce for this encryption
+    aesgcm_key = AESGCM(raw_key)
+    nonce = secrets.token_bytes(12)
+    ciphertext_and_tag = aesgcm_key.encrypt(nonce, plaintext, None)
+
+    # Return self-describing ciphertext format: vault:<key_name>:<base64(nonce+ct+tag)>
+    payload_b64 = base64.b64encode(nonce + ciphertext_and_tag).decode("utf-8")
+    return f"vault:{key_name}:{payload_b64}"
+
+
+def decrypt(ciphertext: str, owner_email: str, dek: bytes | None) -> str:
+    """
+    Decrypt the self-describing ciphertext format.
+    1. Validate vault is unlocked.
+    2. Parse ciphertext format.
+    3. Query key and check ownership. If not matching, log access denial and raise ValueError("PERMISSION_DENIED").
+    4. Check key usage. If not ENCRYPT_DECRYPT, raise ValueError("INVALID_KEY_USAGE").
+    5. Decrypt named key using DEK.
+    6. Decrypt payload using AES-256-GCM.
+    7. Return base64-encoded plaintext.
+    """
+    from src.storage import disk
+
+    if dek is None:
+        raise ValueError("VAULT_LOCKED")
+
+    if not ciphertext or not ciphertext.startswith("vault:"):
+        raise ValueError("INVALID_CIPHERTEXT")
+
+    parts = ciphertext.split(":")
+    if len(parts) != 3:
+        raise ValueError("INVALID_CIPHERTEXT")
+
+    _, key_name, payload_b64 = parts
+
+    try:
+        payload = base64.b64decode(payload_b64)
+    except Exception:
+        raise ValueError("INVALID_CIPHERTEXT")
+
+    if len(payload) < 12 + 16:  # Nonce is 12 bytes, Tag is 16 bytes minimum
+        raise ValueError("INVALID_CIPHERTEXT")
+
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT * FROM transit_keys WHERE key_name = ?",
+        (key_name,)
+    ).fetchone()
+
+    # Access control: If key doesn't exist at all, or belongs to another user
+    if row is None or row["owner_email"] != owner_email:
+        disk.log_denied_access(owner_email, "key", key_name)
+        raise ValueError("PERMISSION_DENIED")
+
+    if row["key_usage"] != "ENCRYPT_DECRYPT":
+        raise ValueError("INVALID_KEY_USAGE")
+
+    # Decrypt the AES key material with the DEK
+    encrypted_key_bytes = base64.b64decode(row["encrypted_key_material_b64"])
+    key_nonce = encrypted_key_bytes[:12]
+    key_ciphertext = encrypted_key_bytes[12:]
+    
+    aesgcm_dek = AESGCM(dek)
+    raw_key = aesgcm_dek.decrypt(key_nonce, key_ciphertext, None)
+
+    # Decrypt the payload
+    nonce = payload[:12]
+    ciphertext_and_tag = payload[12:]
+
+    aesgcm_key = AESGCM(raw_key)
+    try:
+        plaintext = aesgcm_key.decrypt(nonce, ciphertext_and_tag, None)
+    except Exception:
+        raise ValueError("DECRYPTION_FAILED")
+
+    return base64.b64encode(plaintext).decode("utf-8")
+
