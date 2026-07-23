@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from src import core
 from src.auth import auth
 from src.transit import transit
+from src.kv import kv  
+from fastapi.openapi.utils import get_openapi
 
 app = FastAPI(
     title="Mini Vault",
@@ -50,6 +52,9 @@ class VerifyRequest(BaseModel):
     message_type: str
     signature_b64: str
     signing_algorithm: str | None = None  # Optional: if provided, must match the key's stored algorithm
+class WriteSecretRequest(BaseModel):
+    path: str
+    data: dict
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +213,101 @@ def protected_test(authorization: str | None = Header(default=None)):
     # Then check session token
     _require_session(authorization)
     return {"message": "success"}
+
+
+# ---------------------------------------------------------------------------
+# KV Store endpoints (Feature 1.1 & 1.2)
+# ---------------------------------------------------------------------------
+
+@app.post("/kv/write")
+def write_secret_endpoint(
+    req: WriteSecretRequest,
+    authorization: str | None = Header(default=None)
+):
+    """
+    Securely store a secret.
+    Requires: Vault unlocked + Valid session token.
+    Path must start with 'secret/<your_email>/'.
+    """
+    # 1. Kiểm tra trạng thái hệ thống (0.1)
+    if core.get_status() != "unlocked":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VAULT_LOCKED")
+
+    # 2. Kiểm tra phiên đăng nhập (0.2)
+    owner_email = _require_session(authorization)
+
+    # 3. Lấy khóa DEK từ RAM để thực hiện mã hóa
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VAULT_LOCKED")
+
+    try:
+        # Gọi xuống module kv để thực hiện mã hóa và lưu trữ
+        res = kv.write_secret(req.path, req.data, owner_email, dek)
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PERMISSION_DENIED")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err)
+
+
+@app.get("/kv/read")
+def read_secret_endpoint(
+    path: str,  # Nhận path qua query parameter ?path=...
+    authorization: str | None = Header(default=None)
+):
+    """
+    Retrieve and decrypt a secret.
+    Requires: Vault unlocked + Valid session token + Ownership.
+    """
+    if core.get_status() != "unlocked":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VAULT_LOCKED")
+
+    owner_email = _require_session(authorization)
+    dek = core.get_dek()
+    if dek is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VAULT_LOCKED")
+
+    try:
+        res = kv.read_secret(path, owner_email, dek)
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PERMISSION_DENIED")
+        elif err == "NOT_FOUND":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        elif err == "INTEGRITY_FAILURE":
+            # Requirement 1.1: Trả về lỗi nếu tag không khớp (dữ liệu bị sửa đổi)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="INTEGRITY_FAILURE")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err)
+
+
+@app.delete("/kv/delete")
+def delete_secret_endpoint(
+    path: str,
+    authorization: str | None = Header(default=None)
+):
+    """
+    Permanently delete a secret.
+    Requires: Vault unlocked + Valid session token + Ownership.
+    """
+    if core.get_status() != "unlocked":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="VAULT_LOCKED")
+
+    owner_email = _require_session(authorization)
+
+    try:
+        res = kv.delete_secret(path, owner_email)
+        return res
+    except ValueError as e:
+        err = str(e)
+        if err == "PERMISSION_DENIED":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PERMISSION_DENIED")
+        elif err == "NOT_FOUND":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="NOT_FOUND")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err)
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +605,41 @@ def verify_transit_data(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=err
         )
+        
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
 
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    # Register the BearerAuth scheme
+    schema.setdefault("components", {})
+    schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "Paste your session_token from POST /auth/login here."
+        }
+    }
+
+    # Apply BearerAuth to every endpoint that accepts an authorization header
+    for path, methods in schema["paths"].items():
+        for method_info in methods.values():
+            params = method_info.get("parameters", [])
+            has_auth = any(p.get("name") == "authorization" for p in params)
+            if has_auth:
+                method_info.setdefault("security", [{"BearerAuth": []}])
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _custom_openapi
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
